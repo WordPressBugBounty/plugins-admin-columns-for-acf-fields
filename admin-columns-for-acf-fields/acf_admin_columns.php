@@ -1,12 +1,14 @@
 <?php
+if (!defined('ABSPATH')) exit;
+
 /**
  * Plugin Name: Admin Columns for ACF Fields
  * Plugin URI: https://wordpress.org/plugins/acf-admin-columns/
  * Description: Add columns for your ACF fields to post and taxonomy index pages in the WP backend.
- * Version: 0.3.2
+ * Version: 0.3.3.1
  * Author: Florian Eickhorst
  * Author URI: http://www.fleimedia.com/
- * License: GPL
+ * License: GPLv2 or later
  */
 
 class FleiACFAdminColumns
@@ -18,6 +20,28 @@ class FleiACFAdminColumns
     const ACF_SETTING_NAME_WIDTH = self::ACF_SETTING_NAME . '_width';
 
     const COLUMN_NAME_PREFIX = 'acf_';
+
+    const OUTPUT_ALLOWED_TAGS = [
+        'a' => [
+            'href' => [],
+            'title' => [],
+        ],
+        'br' => [],
+        'span' => [
+            'style' => [],
+        ],
+        'img' => [
+            'src' => [],
+            'style' => [],
+            'alt' => [],
+        ],
+        'strong' => [],
+        'em' => [],
+        'p' => [],
+        'div' => [
+            'style' => [],
+        ],
+    ];
 
     protected static $instance;
 
@@ -49,6 +73,8 @@ class FleiACFAdminColumns
         add_action('pre_get_users', array($this, 'wp_action_prepare_columns'), 10);
 
         add_action('pre_get_posts', array($this, 'wp_action_prepare_query_sort'));
+        add_action('pre_get_terms', array($this, 'wp_action_prepare_query_sort'));
+        add_action('pre_get_users', array($this, 'wp_action_prepare_query_sort'));
 
     }
 
@@ -153,11 +179,12 @@ class FleiACFAdminColumns
                 add_filter('posts_distinct', array($this, 'wp_filter_search_distinct'));
             } elseif ($this->screen_is_taxonomy_index) {
                 add_filter('manage_edit-' . $screen->taxonomy . '_columns', array($this, 'wp_filter_manage_posts_columns')); // creates the columns
-                add_filter('manage_' . $screen->taxonomy . '_custom_column', array($this, 'wp_filter_manage_taxonomy_custom_column'), 10, 3); // outputs the columns values for each post
                 add_filter('manage_' . $screen->taxonomy . '_custom_column', array($this, 'wp_filter_manage_custom_column'), 10, 3); // outputs the columns values for each post
+                add_filter('manage_' . $screen->id . '_sortable_columns', array($this, 'wp_filter_manage_sortable_columns')); // make columns sortable
             } elseif ($this->screen_is_user_index) {
                 add_filter('manage_users_columns', array($this, 'wp_filter_manage_posts_columns')); // creates the columns
                 add_filter('manage_users_custom_column', array($this, 'wp_filter_manage_custom_column'), 10, 3); // outputs the columns values for each post
+                add_filter('manage_users_sortable_columns', array($this, 'wp_filter_manage_sortable_columns')); // make columns sortable
             }
 
             add_action('admin_head', array($this, 'wp_action_admin_head')); // add column styling, like column width
@@ -175,7 +202,11 @@ class FleiACFAdminColumns
     public function wp_action_prepare_query_sort($query)
     {
 
-        if ($query->query_vars && isset($query->query_vars['orderby']) && $this->is_acf_active() && $this->get_screen()) {
+        $is_user_query = $query instanceof WP_User_Query;
+        $is_term_query = $query instanceof WP_Term_Query;
+        $is_main_query = $query instanceof WP_Query && $query->is_main_query();
+
+        if (($is_user_query || $is_term_query || $is_main_query) && !empty($query->query_vars['orderby']) && $this->is_acf_active() && $this->get_screen()) {
 
             $sortby_column = $query->query_vars['orderby'];
 
@@ -188,7 +219,7 @@ class FleiACFAdminColumns
                     array('key' => $this->get_column_field_name($sortby_column), 'compare' => 'EXISTS'),
                 );
 
-                $query->set('meta_query', $meta_query);
+                $query->query_vars['meta_query'] = $meta_query;
 
                 $sort_order_type = 'meta_value';
 
@@ -200,7 +231,13 @@ class FleiACFAdminColumns
 
                 $sort_order_type = apply_filters('acf/admin_columns/sort_order_type', $sort_order_type, $field_properties);
 
-                $query->set('orderby', $sort_order_type);
+                if ($is_term_query) {
+                    $query->query_vars['meta_query'] = ['relation' => 'OR'];
+                    $query->query_vars['meta_query'][] = ['key' => $this->get_column_field_name($sortby_column), 'type' => 'NUMERIC'];
+                }
+
+
+                $query->query_vars['orderby'] = $sort_order_type;
             }
         }
 
@@ -337,9 +374,9 @@ class FleiACFAdminColumns
                 $rendered_field_value = apply_filters_deprecated('acf/admin_columns/column/' . $field_name, array($rendered_field_value), '0.2.0', 'acf/admin_columns/render_output');
                 $rendered_field_value = apply_filters_deprecated('acf/admin_columns/column/' . $field_name . '/value', array($rendered_field_value), '0.2.2', 'acf/admin_columns/render_output');
                 if ($echo_value) {
-                    echo $rendered_field_value;
+                    echo wp_kses($rendered_field_value, self::OUTPUT_ALLOWED_TAGS);
                 } else {
-                    return $rendered_field_value;
+                    return wp_kses($rendered_field_value, self::OUTPUT_ALLOWED_TAGS);
                 }
             }
         }
@@ -366,7 +403,7 @@ class FleiACFAdminColumns
             $rendered_field_value = $this->render_column_field(array('column' => $column, 'post_id' => $post_id, 'taxonomy' => $taxonomy));
             $rendered_field_value = apply_filters_deprecated('acf/admin_columns/column/' . $field_name, $rendered_field_value, '0.2.2', 'acf/admin_columns/render_output');
 
-            $content = $rendered_field_value;
+            $content = wp_kses($rendered_field_value, self::OUTPUT_ALLOWED_TAGS);
         }
 
         return $content;
@@ -409,7 +446,7 @@ class FleiACFAdminColumns
             $where_column_sql = '';
             foreach ($this->admin_columns as $column => $description) {
                 $column = $this->get_column_field_name($column);
-                $where_column_sql .= " OR (" . self::COLUMN_NAME_PREFIX . $wpdb->postmeta . ".meta_key ='$column' AND " . self::COLUMN_NAME_PREFIX . $wpdb->postmeta . ".meta_value LIKE $1)";
+                $where_column_sql .= " OR (" . self::COLUMN_NAME_PREFIX . $wpdb->postmeta . ".meta_key ='" . esc_sql($column) . "' AND " . self::COLUMN_NAME_PREFIX . $wpdb->postmeta . ".meta_value LIKE $1)";
             }
 
             $where = preg_replace(
@@ -455,7 +492,8 @@ class FleiACFAdminColumns
 
             $column_width = isset($field_properties[self::ACF_SETTING_NAME_WIDTH]) ? trim($field_properties[self::ACF_SETTING_NAME_WIDTH]) : '';
             if (!empty($column_width)) {
-                $column_styles .= 'width:' . $column_width . ';';
+                $column_width_safe = preg_replace('/[^0-9a-zA-Z.%]/', '', $column_width);
+                $column_styles .= 'width:' . $column_width_safe . ';';
             }
 
             if (!empty($column_styles)) {
@@ -466,7 +504,7 @@ class FleiACFAdminColumns
         if (!empty($all_column_styles)) {
             echo '<style>';
             foreach ($all_column_styles as $column => $column_styles) {
-                echo '.column-' . $column . '{' . $column_styles . '}';
+                echo esc_attr('.column-' . sanitize_html_class($column) . '{' . $column_styles . '};');
             }
             echo '</style>';
         }
@@ -515,18 +553,22 @@ class FleiACFAdminColumns
         $field_value = apply_filters_deprecated('acf/admin_columns/column/' . $field_name . '/before_render_value', array($field_value, $field_properties, $post_id), '0.2.2', 'acf/admin_columns/before_render_output');
         $field_value = apply_filters('acf/admin_columns/before_render_output', $field_value, $field_properties, $post_id);
 
+        $render_is_html = false;
+
         if (!$render_raw) {
 
             switch ($field_properties['type']) {
                 case 'color_picker':
                     if ($field_value) {
-                        $render_output .= '<div style="display:inline-block;height:20px;width:100%;background-color:' . $field_value . ';white-space:nowrap;">' . $field_value . '</div><br>';
+                        $render_is_html = true;
+                        $render_output .= '<div style="display:inline-block;height:20px;width:100%;background-color:' . esc_attr($field_value) . ';white-space:nowrap;">' . esc_html($field_value) . '</div><br>';
                     }
                     break;
                 case 'taxonomy':
                     if (is_array($field_value)) {
+                        $render_is_html = true;
                         foreach ($field_value as $field_taxonomy) {
-                            $render_output .= $field_taxonomy->name . ' (ID ' . $field_taxonomy->term_id . ')<br>';
+                            $render_output .= esc_html($field_taxonomy->name) . ' (ID ' . absint($field_taxonomy->term_id) . ')<br>';
                         }
                     }
                     break;
@@ -534,7 +576,7 @@ class FleiACFAdminColumns
                     $render_output = isset($field_value['filename']) ? $field_value['filename'] : ''; // @todo multiple values
                     break;
                 case 'wysiwyg':
-                    $render_output = wp_trim_excerpt(strip_tags(strval($field_value)));
+                    $render_output = wp_trim_excerpt(wp_strip_all_tags(strval($field_value)));
                     break;
                 case 'link':
                     if (is_array($field_value) && isset($field_value['url'])) {
@@ -549,7 +591,8 @@ class FleiACFAdminColumns
                         $remaining_items_count = count($field_value) - 1;
                     }
                     if ($related_post) {
-                        $render_output = '<a href="' . get_edit_post_link($related_post, false) . '">' . get_the_title($related_post) . '</a>';
+                        $render_is_html = true;
+                        $render_output = '<a href="' . esc_url(get_edit_post_link($related_post, false)) . '">' . esc_html(get_the_title($related_post)) . '</a>';
                     }
                     break;
                 case 'user':
@@ -568,7 +611,8 @@ class FleiACFAdminColumns
                         }
 
                         if (!empty($user)) {
-                            $render_output = '<a href="' . get_edit_user_link($user->ID) . '">' . $user->user_login . (!empty($user->display_name) && $user->user_login !== $user->display_name ? ' (' . $user->display_name . ')' : '') . '</a>';
+                            $render_is_html = true;
+                            $render_output = '<a href="' . esc_url(get_edit_user_link($user->ID)) . '">' . esc_html($user->user_login) . (!empty($user->display_name) && $user->user_login !== $user->display_name ? ' (' . esc_html($user->display_name) . ')' : '') . '</a>';
                         }
                     }
                     break;
@@ -600,7 +644,8 @@ class FleiACFAdminColumns
                         $preview_image_url = apply_filters('acf/admin_columns/preview_image_url', $preview_image_url, $field_properties, $field_value, $post_id);
 
                         if ($preview_image_url) {
-                            $render_output = "<img style='width:100%;height:auto;' src='$preview_image_url'>";
+                            $render_is_html = true;
+                            $render_output = "<img style='width:100%;height:auto;' src='" . esc_url($preview_image_url) . "'>";
 
                             $remaining_items_count = count($field_images) - $preview_item_count;
                         }
@@ -610,6 +655,7 @@ class FleiACFAdminColumns
                 case 'checkbox':
                 case 'select':
                     if (!empty($field_value) && isset($field_properties['return_format'])) {
+                        $render_is_html = true; // render_value_label_field escapes its output
                         if ($field_properties['type'] === 'checkbox' || (!empty($field_properties['multiple']))) {
                             $render_output = array();
                             foreach ($field_value as $field_value_item) {
@@ -638,8 +684,14 @@ class FleiACFAdminColumns
 
             // wrap link around URL field value
             $link_wrap_url = apply_filters('acf/admin_columns/link_wrap_url', true, $field_properties, $original_field_value, $post_id);
-            if ($link_wrap_url && filter_var($render_output, FILTER_VALIDATE_URL)) {
-                $render_output = '<a href="' . $render_output . '">' . $render_output . '</a>';
+            if (!$render_is_html && $link_wrap_url && is_string($render_output) && filter_var($render_output, FILTER_VALIDATE_URL)) {
+                $render_is_html = true;
+                $render_output = '<a href="' . esc_url($render_output) . '">' . esc_html($render_output) . '</a>';
+            }
+
+            // escape plain-text output that wasn't already converted to HTML above
+            if (!$render_is_html && is_string($render_output)) {
+                $render_output = esc_html($render_output);
             }
 
             // convert array entries to column string
@@ -772,7 +824,7 @@ class FleiACFAdminColumns
 
         $search_term = false;
         if (!empty($_GET['s'])) {
-            $search_term = $_GET['s'];
+            $search_term = sanitize_text_field(wp_unslash($_GET['s']));
         }
 
         return $search_term;
@@ -823,7 +875,7 @@ class FleiACFAdminColumns
             }
         }
 
-        return $render_output;
+        return esc_html(strval($render_output));
     }
 
     protected function acf_field_group_has_location_type($post_id, $location, $location_value = null)
@@ -839,10 +891,8 @@ class FleiACFAdminColumns
         }
 
         foreach ($field_group['location'] as $rule_group) {
-            $params = array_column($rule_group, 'param');
-
-            if (in_array($location, $params, true)) {
-                if ($location_value !== null && !in_array($location_value, array_column($rule_group, 'value'), true)) {
+            if (!empty($rule_group[0]['param']) && $rule_group[0]['param'] == $location) {
+                if ($location_value !== null && !empty($rule_group[0]['value']) && !in_array($rule_group[0]['value'], ['all', $location_value])) {
                     continue;
                 }
 
@@ -856,5 +906,5 @@ class FleiACFAdminColumns
 }
 
 if (is_admin()) {
-    $flei_acf_admin_columns = FleiACFAdminColumns::get_instance();
+    $acf_admin_columns_plugin = FleiACFAdminColumns::get_instance();
 }
